@@ -156,7 +156,8 @@ function createDiagramNode(node: DiagramNode): Konva.Group {
   });
   const selected = store.selectedIds.includes(node.id);
   const isMultiSelected = selected && store.selectedIds.length > 1;
-  const stroke = node.locked ? '#8b95a5' : selected ? '#1769ff' : '#9aabbf';
+  const hasConflict = store.nodeConflicts(node.id).length > 0;
+  const stroke = node.locked ? '#8b95a5' : selected ? '#1769ff' : hasConflict ? '#d97706' : '#9aabbf';
 
   if (node.kind === 'rectangle') {
     group.add(
@@ -289,6 +290,31 @@ function createDiagramNode(node: DiagramNode): Konva.Group {
     );
   }
 
+  if (hasConflict) {
+    const badgeX = node.locked ? node.width - 42 : node.width - 26;
+    group.add(
+      new Konva.Circle({
+        x: badgeX + 8,
+        y: 16,
+        radius: 8,
+        fill: '#d97706',
+        stroke: '#ffffff',
+        strokeWidth: 1.5,
+      }),
+    );
+    group.add(
+      new Konva.Text({
+        x: badgeX + 3,
+        y: 10,
+        text: '!',
+        fill: '#ffffff',
+        fontFamily: 'Menlo, monospace',
+        fontSize: 11,
+        fontStyle: 'bold',
+      }),
+    );
+  }
+
   group.on('click tap', (event) => {
     event.cancelBubble = true;
     store.selectNode(node.id, event.evt.shiftKey);
@@ -302,7 +328,6 @@ function createDiagramNode(node: DiagramNode): Konva.Group {
       store.nodes.filter((item) => item.groupId === node.groupId).forEach((item) => groupIds.add(item.id));
     }
     const ids = [...groupIds];
-    store.checkpoint();
     dragState = {
       ids,
       primaryId: node.id,
@@ -360,7 +385,7 @@ function createDiagramNode(node: DiagramNode): Konva.Group {
         { x: point.x + deltaX, y: point.y + deltaY },
       ]),
     );
-    store.commitPositions(positions);
+    store.commitPositions(positions, dragState.startPositions);
     dragState = null;
     clearGuides();
     void nextTick(renderDiagram);
@@ -464,13 +489,15 @@ function createCenteredText(text: string, width: number, height: number, maxWidt
 function createConnectorNode(connector: DiagramConnector): Konva.Group {
   const points = routeConnector(connector, store.nodes);
   const selected = store.selectedConnectorId === connector.id;
+  const hasConflict = store.connectorHasConflict(connector.id);
+  const strokeColor = selected ? '#1769ff' : hasConflict ? '#d97706' : connector.color;
   const group = new Konva.Group({ listening: true });
   const arrow = new Konva.Arrow({
     points,
-    stroke: selected ? '#1769ff' : connector.color,
-    fill: selected ? '#1769ff' : connector.color,
-    strokeWidth: selected ? 2.8 : 1.8,
-    dash: connector.dashed ? [9, 6] : undefined,
+    stroke: strokeColor,
+    fill: strokeColor,
+    strokeWidth: selected ? 2.8 : hasConflict ? 2.6 : 1.8,
+    dash: connector.dashed ? [9, 6] : hasConflict ? [6, 4] : undefined,
     pointerLength: 10,
     pointerWidth: 9,
     lineJoin: 'round',
@@ -690,15 +717,16 @@ function handleKeyboard(event: KeyboardEvent) {
       ArrowDown: { x: 0, y: amount },
     }[event.key];
     if (!delta) return;
-    store.checkpoint();
-    store.commitPositions(
-      Object.fromEntries(
-        store.selectedNodes.map((node) => [
-          node.id,
-          { x: node.x + delta.x, y: node.y + delta.y },
-        ]),
-      ),
+    const startPositions = Object.fromEntries(
+      store.selectedNodes.map((node) => [node.id, { x: node.x, y: node.y }]),
     );
+    const nextPositions = Object.fromEntries(
+      store.selectedNodes.map((node) => [
+        node.id,
+        { x: node.x + delta.x, y: node.y + delta.y },
+      ]),
+    );
+    store.commitPositions(nextPositions, startPositions);
     void nextTick(renderDiagram);
   }
 }

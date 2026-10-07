@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Delete, Lock, Unlock } from '@element-plus/icons-vue';
+import { Delete, Lock, Unlock, WarningFilled } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { computed, ref, watch } from 'vue';
 import { useDiagramStore } from '../stores/diagram';
@@ -21,6 +21,68 @@ watch(
 const activeConnector = computed(
   () => store.connectors.find((connector) => connector.id === store.selectedConnectorId) ?? null,
 );
+
+const FIELD_LABELS: Record<string, string> = {
+  position: '位置',
+  x: 'X',
+  y: 'Y',
+  width: '宽度',
+  height: '高度',
+  text: '名称',
+  color: '颜色',
+  locked: '锁定',
+  groupId: '分组',
+  zIndex: '层级',
+  fields: '表字段',
+  label: '标签',
+  dashed: '虚线',
+  fromAnchor: '起点锚点',
+  toAnchor: '终点锚点',
+  title: '文档标题',
+};
+
+const ANCHOR_LABELS: Record<string, string> = {
+  top: '上',
+  right: '右',
+  bottom: '下',
+  left: '左',
+};
+
+function fieldLabel(field: string): string {
+  return FIELD_LABELS[field] ?? field;
+}
+
+function formatValue(value: unknown, field: string): string {
+  if (value === null || value === undefined) return '空';
+  if (field === 'position' && typeof value === 'object') {
+    const point = value as { x: number; y: number };
+    return `x: ${Math.round(point.x)}, y: ${Math.round(point.y)}`;
+  }
+  if (field === 'fields' && Array.isArray(value)) {
+    return value.length ? value.join(' / ') : '（无字段）';
+  }
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  if (field === 'fromAnchor' || field === 'toAnchor') {
+    return ANCHOR_LABELS[String(value)] ?? String(value);
+  }
+  if (field === 'groupId') return value ? '已分组' : '无分组';
+  if (typeof value === 'string') return value || '（空）';
+  return String(value);
+}
+
+function objectName(entry: { target: string; id: string | null }): string {
+  if (entry.target === 'doc') return '文档';
+  if (entry.target === 'node') {
+    return store.nodes.find((node) => node.id === entry.id)?.text ?? '已删除图元';
+  }
+  const connector = store.connectors.find((item) => item.id === entry.id);
+  return connector?.label ? `连接线「${connector.label}」` : '连接线';
+}
+
+function chooseConflict(key: string, value: unknown) {
+  store.resolveConflict(key, value);
+  ElMessage.success('已采用所选取值，并同步给所有标签页');
+}
 
 function patchNode(patch: Parameters<typeof store.patchNode>[1]) {
   if (store.activeNode) store.patchNode(store.activeNode.id, patch);
@@ -66,9 +128,62 @@ async function removeSelection() {
       <span>{{ store.selectedIds.length }} 个图元</span>
     </div>
 
+    <!-- 共编冲突：两边取值都保留，等人选定 -->
+    <section v-if="store.conflictEntries.length" class="conflict-section">
+      <div class="conflict-head">
+        <WarningFilled />
+        <strong>共编冲突 {{ store.conflictEntries.length }}</strong>
+      </div>
+      <p class="conflict-hint">两个标签页同时改了同一属性，画布保留先到的取值，请选定最终值：</p>
+      <article v-for="entry in store.conflictEntries" :key="entry.key" class="conflict-card">
+        <header>
+          <span class="conflict-object">{{ objectName(entry) }}</span>
+          <span class="conflict-field">{{ fieldLabel(entry.field) }}</span>
+        </header>
+        <div class="conflict-sides">
+          <button
+            type="button"
+            class="conflict-side"
+            :class="{ 'is-own': entry.first.tab === store.tabId, 'is-current': true }"
+            @click="chooseConflict(entry.key, entry.first.value)"
+          >
+            <span class="side-meta">
+              先到 · 画布现值
+              <em v-if="entry.first.tab === store.tabId">（本标签页）</em>
+            </span>
+            <span class="side-value">{{ formatValue(entry.first.value, entry.field) }}</span>
+            <span class="side-choose">采用此值</span>
+          </button>
+          <button
+            type="button"
+            class="conflict-side"
+            :class="{ 'is-own': entry.other.tab === store.tabId }"
+            @click="chooseConflict(entry.key, entry.other.value)"
+          >
+            <span class="side-meta">
+              后到
+              <em v-if="entry.other.tab === store.tabId">（本标签页）</em>
+            </span>
+            <span class="side-value">{{ formatValue(entry.other.value, entry.field) }}</span>
+            <span class="side-choose">采用此值</span>
+          </button>
+        </div>
+      </article>
+    </section>
+
     <template v-if="store.activeNode">
       <div class="property-group">
-        <div class="section-label">基础信息</div>
+        <div class="section-label">
+          基础信息
+          <el-tag
+            v-if="store.nodeConflicts(store.activeNode.id).length"
+            type="warning"
+            size="small"
+            effect="plain"
+          >
+            {{ store.nodeConflicts(store.activeNode.id).length }} 项待裁定
+          </el-tag>
+        </div>
         <label>
           <span>名称 / 标题</span>
           <el-input v-model="textDraft" @blur="applyText" @keydown.enter="applyText" />
@@ -153,7 +268,17 @@ async function removeSelection() {
 
     <template v-else-if="activeConnector">
       <div class="property-group">
-        <div class="section-label">连接线</div>
+        <div class="section-label">
+          连接线
+          <el-tag
+            v-if="store.connectorHasConflict(activeConnector.id)"
+            type="warning"
+            size="small"
+            effect="plain"
+          >
+            有待裁定
+          </el-tag>
+        </div>
         <label>
           <span>标签</span>
           <el-input
@@ -202,7 +327,7 @@ async function removeSelection() {
       </div>
     </template>
 
-    <div v-else class="empty-properties">
+    <div v-else-if="!store.conflictEntries.length" class="empty-properties">
       <strong>未选择对象</strong>
       <span>在画布中选择图元或连接线后，可在此调整文字、位置、颜色、锁定和层级。</span>
     </div>
