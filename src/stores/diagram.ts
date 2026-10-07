@@ -3,20 +3,34 @@ import type {
   DiagramConnector,
   DiagramDocument,
   DiagramNode,
+  FieldConflict,
   NodeKind,
+  SyncStatus,
   ToolMode,
 } from '../types/diagram';
 import { DEFAULT_NODE_SIZE } from '../utils/diagramGeometry';
+import {
+  STORAGE_KEY,
+  broadcastDocument,
+  clonePlain,
+  getOrCreateTabId,
+  mergeDocuments,
+  readStoredDocument,
+  subscribeToBroadcast,
+  subscribeToStorage,
+  valuesEqual,
+  writeDocumentToStorage,
+} from '../utils/collab';
 
-const STORAGE_KEY = 'pair-wise-yy-07-diagram';
 let persistTimer: number | undefined;
+let syncedBase: DiagramDocument | null = null;
+let lastSuccessfulSnapshot: DiagramDocument | null = null;
+let skipRevisionBump = false;
+let unsubBroadcast: (() => void) | null = null;
+let unsubStorage: (() => void) | null = null;
 
 function makeId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-}
-
-function clonePlain<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function initialNodes(): DiagramNode[] {
@@ -152,24 +166,17 @@ interface HistoryState {
   future: DiagramDocument[];
 }
 
-function loadDocument(): DiagramDocument | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const document = JSON.parse(raw) as DiagramDocument;
-    return document.version === 1 && Array.isArray(document.nodes) ? document : null;
-  } catch {
-    return null;
-  }
-}
-
-const savedDocument = loadDocument();
+const savedDocument = readStoredDocument();
 
 export const useDiagramStore = defineStore('diagram', {
   state: () => ({
     title: savedDocument?.title ?? '订单履约架构图',
     nodes: savedDocument?.nodes ?? initialNodes(),
     connectors: savedDocument?.connectors ?? initialConnectors(),
+    revision: savedDocument?.revision ?? 0,
+    conflicts: [] as FieldConflict[],
+    tabId: '',
+    syncStatus: 'idle' as SyncStatus,
     selectedIds: [] as string[],
     selectedConnectorId: null as string | null,
     activeNodeId: null as string | null,
@@ -194,6 +201,7 @@ export const useDiagramStore = defineStore('diagram', {
     snapshot(): DiagramDocument {
       return {
         version: 1,
+        revision: this.revision,
         title: this.title,
         nodes: clonePlain(this.nodes),
         connectors: clonePlain(this.connectors),
@@ -210,12 +218,14 @@ export const useDiagramStore = defineStore('diagram', {
       if (!previous) return;
       this.history.future.push(this.snapshot());
       this.restore(previous);
+      this.persistSoon();
     },
     redo() {
       const next = this.history.future.pop();
       if (!next) return;
       this.history.past.push(this.snapshot());
       this.restore(next);
+      this.persistSoon();
     },
     restore(document: DiagramDocument) {
       this.title = document.title;
@@ -261,6 +271,12 @@ export const useDiagramStore = defineStore('diagram', {
       const node = this.nodes.find((item) => item.id === id);
       if (!node) return;
       Object.assign(node, patch);
+      for (const key of Object.keys(patch)) {
+        const conflict = this.conflicts.find(
+          (item) => item.entityKind === 'node' && item.entityId === id && item.field === key,
+        );
+        if (conflict) conflict.localValue = (node as Record<string, unknown>)[key];
+      }
       this.persistSoon();
     },
     patchNode(id: string, patch: Partial<DiagramNode>) {
@@ -298,7 +314,12 @@ export const useDiagramStore = defineStore('diagram', {
       this.selectedConnectorId = null;
       this.activeNodeId = null;
     },
-    addConnector(fromId: string, toId: string, fromAnchor: DiagramConnector['fromAnchor'], toAnchor: DiagramConnector['toAnchor']) {
+    addConnector(
+      fromId: string,
+      toId: string,
+      fromAnchor: DiagramConnector['fromAnchor'],
+      toAnchor: DiagramConnector['toAnchor'],
+    ) {
       if (fromId === toId) return;
       const exists = this.connectors.some(
         (connector) =>
@@ -327,6 +348,12 @@ export const useDiagramStore = defineStore('diagram', {
       const connector = this.connectors.find((item) => item.id === id);
       if (!connector) return;
       Object.assign(connector, patch);
+      for (const key of Object.keys(patch)) {
+        const conflict = this.conflicts.find(
+          (item) => item.entityKind === 'connector' && item.entityId === id && item.field === key,
+        );
+        if (conflict) conflict.localValue = (connector as Record<string, unknown>)[key];
+      }
       this.persistSoon();
     },
     patchConnector(id: string, patch: Partial<DiagramConnector>) {
@@ -470,7 +497,10 @@ export const useDiagramStore = defineStore('diagram', {
       const maxY = Math.max(...this.nodes.map((node) => node.y + node.height));
       const width = maxX - minX;
       const height = maxY - minY;
-      this.zoom = Math.min(1.4, Math.max(0.3, Math.min((viewportWidth - 100) / width, (viewportHeight - 100) / height)));
+      this.zoom = Math.min(
+        1.4,
+        Math.max(0.3, Math.min((viewportWidth - 100) / width, (viewportHeight - 100) / height)),
+      );
       this.pan = {
         x: (viewportWidth - width * this.zoom) / 2 - minX * this.zoom,
         y: (viewportHeight - height * this.zoom) / 2 - minY * this.zoom,
@@ -481,11 +511,154 @@ export const useDiagramStore = defineStore('diagram', {
       this.restore(document);
       this.persistSoon();
     },
+
+    // ---- 共编修订 ----
+
+    /** 打开时升级旧数据、接入标签页会话与本地草稿。 */
+    initSync() {
+      this.tabId = getOrCreateTabId();
+      const stored = readStoredDocument();
+      if (stored) {
+        this.title = stored.title;
+        this.nodes = clonePlain(stored.nodes);
+        this.connectors = clonePlain(stored.connectors);
+        this.revision = stored.revision;
+      } else {
+        this.revision = 1;
+      }
+      // 持久化升级后的修订号，让本地草稿与共编起点一致。
+      skipRevisionBump = true;
+      this.persistSoon();
+      syncedBase = clonePlain(this.snapshot());
+      lastSuccessfulSnapshot = clonePlain(this.snapshot());
+      unsubBroadcast = subscribeToBroadcast((doc, tabId) => this.applyRemoteDocument(doc, tabId));
+      unsubStorage = subscribeToStorage((doc) => this.applyRemoteDocument(doc, 'storage'));
+      document.addEventListener('visibilitychange', this.handleVisibility);
+      window.addEventListener('pageshow', this.handlePageShow);
+      window.addEventListener('beforeunload', this.handleBeforeUnload);
+    },
+
+    /** 接收其他标签页的文档，三方合并后接入。 */
+    applyRemoteDocument(remote: DiagramDocument, remoteTabId: string) {
+      if (remoteTabId === this.tabId) return;
+      if (valuesEqual(remote, this.snapshot())) return;
+      if (!syncedBase) syncedBase = clonePlain(this.snapshot());
+      this.syncStatus = 'syncing';
+      const result = mergeDocuments(
+        syncedBase,
+        this.snapshot(),
+        remote,
+        this.tabId,
+        remoteTabId,
+      );
+      this.mergeConflicts(result.conflicts);
+      this.restore(result.document);
+      this.revision = result.document.revision;
+      syncedBase = clonePlain(result.document);
+      skipRevisionBump = true;
+      this.persistSoon();
+      this.syncStatus = 'idle';
+    },
+
+    /** 标签页休眠回来后，先把离开期间的改动合并进来。 */
+    mergeAwayChanges() {
+      const stored = readStoredDocument();
+      if (!stored) return;
+      if (valuesEqual(stored, this.snapshot())) return;
+      if (!syncedBase) syncedBase = clonePlain(this.snapshot());
+      const result = mergeDocuments(syncedBase, this.snapshot(), stored, this.tabId, 'away');
+      this.mergeConflicts(result.conflicts);
+      this.restore(result.document);
+      this.revision = result.document.revision;
+      syncedBase = clonePlain(result.document);
+      skipRevisionBump = true;
+      this.persistSoon();
+    },
+
+    mergeConflicts(incoming: FieldConflict[]) {
+      const existing = new Set(
+        this.conflicts.map(
+          (item) =>
+            `${item.entityId}:${item.field}:${JSON.stringify(item.localValue)}:${JSON.stringify(item.remoteValue)}`,
+        ),
+      );
+      const fresh = incoming.filter(
+        (item) =>
+          !existing.has(
+            `${item.entityId}:${item.field}:${JSON.stringify(item.localValue)}:${JSON.stringify(item.remoteValue)}`,
+          ),
+      );
+      if (fresh.length) this.conflicts = [...this.conflicts, ...fresh];
+    },
+
+    /** 属性面板选择冲突取值后落地。 */
+    resolveConflict(conflictId: string, choice: 'local' | 'remote') {
+      const conflict = this.conflicts.find((item) => item.id === conflictId);
+      if (!conflict) return;
+      if (choice === 'remote') {
+        if (conflict.field === '__delete__') {
+          if (conflict.entityKind === 'node') {
+            this.nodes = this.nodes.filter((node) => node.id !== conflict.entityId);
+            this.connectors = this.connectors.filter(
+              (connector) =>
+                connector.fromId !== conflict.entityId && connector.toId !== conflict.entityId,
+            );
+          } else if (conflict.entityKind === 'connector') {
+            this.connectors = this.connectors.filter(
+              (connector) => connector.id !== conflict.entityId,
+            );
+          }
+        } else if (conflict.entityKind === 'title') {
+          this.title = conflict.remoteValue as string;
+        } else if (conflict.entityKind === 'node') {
+          const node = this.nodes.find((item) => item.id === conflict.entityId);
+          if (node) (node as Record<string, unknown>)[conflict.field] = conflict.remoteValue;
+        } else if (conflict.entityKind === 'connector') {
+          const connector = this.connectors.find((item) => item.id === conflict.entityId);
+          if (connector) {
+            (connector as Record<string, unknown>)[conflict.field] = conflict.remoteValue;
+          }
+        }
+      }
+      this.conflicts = this.conflicts.filter((item) => item.id !== conflictId);
+      this.persistSoon();
+    },
+
+    handleVisibility() {
+      if (document.visibilityState === 'visible') this.mergeAwayChanges();
+    },
+    handlePageShow(event: PageTransitionEvent) {
+      if (event.persisted) this.mergeAwayChanges();
+    },
+    handleBeforeUnload() {
+      if (persistTimer) {
+        window.clearTimeout(persistTimer);
+        persistTimer = undefined;
+        this.flushPersist();
+      }
+    },
+
+    /** 事务性落盘：失败则回滚到上次成功的文档，不留改到一半的画布。 */
+    flushPersist() {
+      if (!skipRevisionBump) this.revision += 1;
+      skipRevisionBump = false;
+      const doc = this.snapshot();
+      const ok = writeDocumentToStorage(doc);
+      if (ok) {
+        lastSuccessfulSnapshot = clonePlain(doc);
+        broadcastDocument(doc, this.tabId);
+        this.syncStatus = 'idle';
+      } else {
+        if (lastSuccessfulSnapshot) {
+          this.restore(lastSuccessfulSnapshot);
+          this.revision = lastSuccessfulSnapshot.revision;
+        }
+        this.syncStatus = 'error';
+      }
+    },
     persistSoon() {
       window.clearTimeout(persistTimer);
-      persistTimer = window.setTimeout(() => {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(this.snapshot()));
-      }, 180);
+      persistTimer = window.setTimeout(() => this.flushPersist(), 180);
     },
   },
 });

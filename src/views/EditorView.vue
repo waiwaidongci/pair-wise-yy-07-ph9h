@@ -16,9 +16,10 @@ import {
   Top,
   Unlock,
   Upload,
+  Warning,
 } from '@element-plus/icons-vue';
 import { ElMessage } from 'element-plus';
-import { nextTick, ref } from 'vue';
+import { computed, nextTick, onMounted, ref } from 'vue';
 import DiagramCanvas from '../components/DiagramCanvas.vue';
 import PropertiesPanel from '../components/PropertiesPanel.vue';
 import ShapePalette from '../components/ShapePalette.vue';
@@ -27,6 +28,23 @@ import type { DiagramDocument } from '../types/diagram';
 
 const store = useDiagramStore();
 const importInput = ref<HTMLInputElement | null>(null);
+
+const syncLabel = computed(() => {
+  switch (store.syncStatus) {
+    case 'syncing':
+      return '同步中…';
+    case 'error':
+      return '保存失败，已恢复';
+    case 'offline':
+      return '离线';
+    default:
+      return '已同步';
+  }
+});
+
+onMounted(() => {
+  store.initSync();
+});
 
 function saveNow() {
   store.persistSoon();
@@ -74,7 +92,10 @@ function run(action: () => void, message?: string) {
       </div>
       <div class="document-title">
         <el-input v-model="store.title" class="title-input" @change="store.persistSoon()" />
-        <span class="save-state"><Finished /> 已自动保存</span>
+        <span class="save-state" :class="{ 'save-state--error': store.syncStatus === 'error' }">
+          <el-icon><Warning v-if="store.syncStatus === 'error'" /><Finished v-else /></el-icon>
+          {{ syncLabel }}
+        </span>
       </div>
       <div class="header-actions">
         <router-link class="guide-link" to="/guide">快捷键说明</router-link>

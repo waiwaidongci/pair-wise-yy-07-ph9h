@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { Delete, Lock, Unlock } from '@element-plus/icons-vue';
+import { Delete, Lock, Unlock, Warning } from '@element-plus/icons-vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import { computed, ref, watch } from 'vue';
 import { useDiagramStore } from '../stores/diagram';
-import type { AnchorSide } from '../types/diagram';
+import type { AnchorSide, FieldConflict } from '../types/diagram';
 
 const store = useDiagramStore();
 const textDraft = ref('');
@@ -21,6 +21,37 @@ watch(
 const activeConnector = computed(
   () => store.connectors.find((connector) => connector.id === store.selectedConnectorId) ?? null,
 );
+
+/** 当前选中实体（图元 / 连接线 / 标题）上未解决的共编冲突。 */
+const activeConflicts = computed<FieldConflict[]>(() => {
+  if (store.activeNodeId) {
+    return store.conflicts.filter(
+      (conflict) => conflict.entityKind === 'node' && conflict.entityId === store.activeNodeId,
+    );
+  }
+  if (store.selectedConnectorId) {
+    return store.conflicts.filter(
+      (conflict) =>
+        conflict.entityKind === 'connector' && conflict.entityId === store.selectedConnectorId,
+    );
+  }
+  return store.conflicts.filter((conflict) => conflict.entityKind === 'title');
+});
+
+function formatConflictValue(field: string, value: unknown): string {
+  if (field === '__delete__') return String(value);
+  if (field === 'fields' && Array.isArray(value)) return value.join('\n');
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return String(value);
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  if (value == null) return '（空）';
+  return JSON.stringify(value);
+}
+
+function resolve(conflict: FieldConflict, choice: 'local' | 'remote') {
+  store.resolveConflict(conflict.id, choice);
+  ElMessage.success(choice === 'local' ? '已采用本标签页的值' : '已采用其他标签页的值');
+}
 
 function patchNode(patch: Parameters<typeof store.patchNode>[1]) {
   if (store.activeNode) store.patchNode(store.activeNode.id, patch);
@@ -64,6 +95,41 @@ async function removeSelection() {
     <div class="panel-title">
       <strong>属性</strong>
       <span>{{ store.selectedIds.length }} 个图元</span>
+    </div>
+
+    <div v-if="activeConflicts.length" class="conflict-banner">
+      <div class="conflict-banner__head">
+        <el-icon><Warning /></el-icon>
+        <strong>检测到 {{ activeConflicts.length }} 处共编冲突</strong>
+      </div>
+      <p class="conflict-banner__hint">
+        其他标签页同时改了同一处，两边取值都保留，请选择采用哪一边。
+      </p>
+      <div v-for="conflict in activeConflicts" :key="conflict.id" class="conflict-card">
+        <div class="conflict-card__field">{{ conflict.fieldLabel }}</div>
+        <div class="conflict-card__values">
+          <button
+            type="button"
+            class="conflict-value"
+            :class="{ 'conflict-value--delete': conflict.field === '__delete__' && String(conflict.localValue).includes('删除') }"
+            @click="resolve(conflict, 'local')"
+          >
+            <span class="conflict-value__tag">本标签页</span>
+            <span class="conflict-value__text">{{ formatConflictValue(conflict.field, conflict.localValue) }}</span>
+            <span class="conflict-value__action">采用</span>
+          </button>
+          <button
+            type="button"
+            class="conflict-value"
+            :class="{ 'conflict-value--delete': conflict.field === '__delete__' && String(conflict.remoteValue).includes('删除') }"
+            @click="resolve(conflict, 'remote')"
+          >
+            <span class="conflict-value__tag">其他标签页</span>
+            <span class="conflict-value__text">{{ formatConflictValue(conflict.field, conflict.remoteValue) }}</span>
+            <span class="conflict-value__action">采用</span>
+          </button>
+        </div>
+      </div>
     </div>
 
     <template v-if="store.activeNode">

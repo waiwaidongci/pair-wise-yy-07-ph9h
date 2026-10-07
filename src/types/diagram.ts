@@ -32,11 +32,28 @@ export interface DiagramConnector {
 
 export interface DiagramDocument {
   version: 1;
+  /** 共编修订号；旧数据没有修订号，打开时升级为共同起点 1。 */
+  revision: number;
   title: string;
   nodes: DiagramNode[];
   connectors: DiagramConnector[];
   updatedAt: number;
 }
+
+/** 两处同时编辑同一字段时保留的冲突取值，留在属性面板等人选定。 */
+export interface FieldConflict {
+  id: string;
+  entityKind: 'node' | 'connector' | 'title';
+  entityId: string;
+  field: string;
+  fieldLabel: string;
+  localValue: unknown;
+  remoteValue: unknown;
+  localTab: string;
+  remoteTab: string;
+}
+
+export type SyncStatus = 'idle' | 'syncing' | 'offline' | 'error';
 
 export interface Point {
   x: number;
